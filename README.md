@@ -10,6 +10,7 @@ It is designed for robust, safe, and auditable remediation, with a focus on Helm
 3. **_Stable Revision Tracking_**: After a successful Helm deployment or upgrade, the agent marks the revision as stable in a ConfigMap. This enables safe rollbacks to known-good states.
 
 **_Separation of Concerns via Parallel Processes_**:<br>
+
 **_Process 1_**: Continuously checks for failed pods and, if the LLM recommends, performs a rollback to the last stable revision recorded in the ConfigMap. This process does not wait for new revisions to be marked as stable.<br>
 **_Process 2_**: Monitors Helm install/upgrade events. After each deployment, it waits (e.g., 30 seconds) to verify pod health. If the deployment is stable, it updates the ConfigMap with the new stable revision.
 This process ensures only healthy revisions are marked as stable, independent of the remediation process.
