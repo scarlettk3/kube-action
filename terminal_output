@@ -1,0 +1,44 @@
+C:\Users\nkdua\Downloads\actionupdateVS>kubectl cp kube-action.py k8s-error-agent-dev-6579b68854-gcm9b:/app/kube-action.py
+
+C:\Users\nkdua\Downloads\actionupdateVS>kubectl exec -it k8s-error-agent-dev-6579b68854-gcm9b -- /bin/bash
+root@k8s-error-agent-dev-6579b68854-gcm9b:/# cd /app
+root@k8s-error-agent-dev-6579b68854-gcm9b:/app# python kube-action.py
+success
+2025-07-08 05:35:49,627 - k8s-error-agent-dev - INFO - Loaded in-cluster Kubernetes configuration
+2025-07-08 05:35:49,631 - k8s-error-agent-dev - INFO - Starting Kubernetes Error Analysis Agent (with deployment watch and sequential failed pod analysis)
+2025-07-08 05:35:49,633 - k8s-error-agent-dev - INFO - Starting Deployment watch for Helm install/upgrade events...
+2025-07-08 05:35:49,828 - k8s-error-agent-dev - INFO - Found 4 namespaces
+2025-07-08 05:35:50,033 - k8s-error-agent-dev - INFO - Detected new revision 25 for Helm release nginx-1 in namespace default. Waiting 30s for pod health check...
+2025-07-08 05:35:50,400 - k8s-error-agent-dev - INFO - Found failed pod: default/nginx-1-695f57cc6d-tfgmk (uid=9eec659d-b06d-4a1e-99f1-3eb0acaa15ed)
+2025-07-08 05:35:50,412 - k8s-error-agent-dev - INFO - Found 1 failed pods in namespace default
+2025-07-08 05:35:50,413 - k8s-error-agent-dev - INFO - Analyzing failed pod nginx-1-695f57cc6d-tfgmk (uid=9eec659d-b06d-4a1e-99f1-3eb0acaa15ed) in namespace default using process_failed_pod_enhanced...
+2025-07-08 05:35:54,611 - k8s-error-agent-dev - INFO - 
+====================================================================================================
+2025-07-08 05:35:54,612 - k8s-error-agent-dev - INFO - ENHANCED ANALYSIS FOR POD: nginx-1-695f57cc6d-tfgmk IN NAMESPACE: default 
+2025-07-08 05:35:54,613 - k8s-error-agent-dev - INFO - ====================================================================================================
+2025-07-08 05:35:54,614 - k8s-error-agent-dev - INFO - ROOT CAUSE: The init container "preserve-logs-symlinks" is failing because it's trying to execute `/bin/bash` which doesn't exist in the `busybox:latest` image, causing a CrashLoopBackOff.
+2025-07-08 05:35:54,614 - k8s-error-agent-dev - INFO - RECOMMENDED ACTION: ROLLBACK
+2025-07-08 05:35:54,617 - k8s-error-agent-dev - INFO - CONFIDENCE: HIGH
+2025-07-08 05:35:54,619 - k8s-error-agent-dev - INFO - REASONING: The error message clearly indicates the init container fails because it can't find `/bin/bash` in the busybox image. This is a configuration issue where the init container is likely trying to run a bash script but the image doesn't have bash installed. A Helm rollback would revert to a previous working configuration where this mismatch didn't exist.
+2025-07-08 05:35:54,619 - k8s-error-agent-dev - INFO - ADDITIONAL CHECKS:  1. Verify the init container command in the Helm chart values or deployment manifest 2. Check if the init container should use a different image that includes bash 3. Review the Helm release history to confirm the previous working version
+2025-07-08 05:35:54,620 - k8s-error-agent-dev - INFO - ====================================================================================================
+2025-07-08 05:35:54,620 - k8s-error-agent-dev - INFO - Executing ROLLBACK action for Helm release nginx-1
+2025-07-08 05:35:59,914 - k8s-error-agent-dev - INFO - Successfully rolled back nginx-1 to revision 26
+2025-07-08 05:36:00,223 - k8s-error-agent-dev - WARNING - Revision changed from 28 to None during health check. Aborting stable mark.
+2025-07-08 05:36:00,314 - k8s-error-agent-dev - INFO - Detected new revision 26 for Helm release nginx-1 in namespace default. Waiting 30s for pod health check...
+2025-07-08 05:36:04,927 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-node-lease
+2025-07-08 05:36:04,939 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-public
+2025-07-08 05:36:05,218 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-system
+2025-07-08 05:36:05,219 - k8s-error-agent-dev - INFO - Sleeping for 60 seconds before next check
+2025-07-08 05:36:15,638 - k8s-error-agent-dev - INFO - Updated ConfigMap helm-stable-revisions with nginx-1: 29
+2025-07-08 05:36:15,638 - k8s-error-agent-dev - INFO - Release nginx-1 revision 29 marked as stable in ConfigMap.
+2025-07-08 05:37:05,235 - k8s-error-agent-dev - INFO - Found 4 namespaces
+2025-07-08 05:37:05,391 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace default
+2025-07-08 05:37:05,405 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-node-lease
+2025-07-08 05:37:05,421 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-public
+2025-07-08 05:37:05,704 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-system
+2025-07-08 05:37:05,705 - k8s-error-agent-dev - INFO - Sleeping for 60 seconds before next check
+2025-07-08 05:38:05,720 - k8s-error-agent-dev - INFO - Found 4 namespaces
+2025-07-08 05:38:05,890 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace default
+2025-07-08 05:38:05,902 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-node-lease
+2025-07-08 05:38:05,918 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-public
