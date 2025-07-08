@@ -3,4 +3,34 @@ Inside you directory:
 > kubectl apply -f rbac.yaml
 > kubectl apply -f deployment.yaml ---->for first time then else use the below
 > kubectl rollout restart deployment k8s-error-agent-dev
+copy the files into the pod
+> kubectl cp main.py k8s-error-agent-dev-XXXX:app/main.py 
+> kubectl cp requirements.txt k8s-error-agent-dev-XXXX:/app/requirements.txt
 
+# If you have other files, copy them too 
+> kubectl cp kube-action.py k8s-error-agent-dev-XXXX:/app/kube-action.py
+
+>Install dependencies and run:
+bash
+# Access the pod shell
+> kubectl exec -it k8s-error-agent-dev-XXXX -- /bin/bash
+
+
+
+# Inside the pod:
+> cd /app
+> pip install -r requirements.txt                           -----install requirements inside the pod
+
+for helm:
+> apt-get update && apt-get install -y curl gnupg2
+> curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+> chmod 700 get_helm.sh 
+> ./get_helm.sh 
+> rm get_helm.sh
+> helm version                          ----to verify if its installed.
+
+
+requirements.txt
+---------------------
+kubernetes==28.1.0
+requests==2.31.0
