@@ -1,6 +1,6 @@
-C:\Users\nkdua\Downloads\actionupdateVS>kubectl cp kube-action.py k8s-error-agent-dev-6579b68854-gcm9b:/app/kube-action.py
+C:\Users\****\Downloads\actionupdateVS>kubectl cp kube-action.py k8s-error-agent-dev-6579b68854-gcm9b:/app/kube-action.py
 
-C:\Users\nkdua\Downloads\actionupdateVS>kubectl exec -it k8s-error-agent-dev-6579b68854-gcm9b -- /bin/bash
+C:\Users\****\Downloads\actionupdateVS>kubectl exec -it k8s-error-agent-dev-6579b68854-gcm9b -- /bin/bash
 root@k8s-error-agent-dev-6579b68854-gcm9b:/# cd /app
 root@k8s-error-agent-dev-6579b68854-gcm9b:/app# python kube-action.py
 success
