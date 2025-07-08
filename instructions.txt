@@ -1,1 +1,6 @@
+Inside you directory:
+
+> kubectl apply -f rbac.yaml
+> kubectl apply -f deployment.yaml ---->for first time then else use the below
+> kubectl rollout restart deployment k8s-error-agent-dev
 
