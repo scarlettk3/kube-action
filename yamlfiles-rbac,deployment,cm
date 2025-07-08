@@ -159,3 +159,22 @@ metadata:
 type: Opaque
 stringData:
   api-key: "Mdi0g0PXCIbLHxLZxmEDhON657hbyX7j"
+
+===================================================================================
+CONFIG MAP created by agent: helm-stable-revisions
+C:\Users\****\Downloads\actionupdateVS>kubectl get cm/helm-stable-revisions -o yaml
+apiVersion: v1
+data:
+  nginx: "17"
+  nginx-1: "29"
+  nginx-2: "1"
+  nginx-3: "3"
+  nginx-4: "1"
+  nginx-5: "1"
+kind: ConfigMap
+metadata:
+  creationTimestamp: "2025-07-01T07:18:29Z"
+  name: helm-stable-revisions
+  namespace: default
+  resourceVersion: "151721"
+  uid: d8585864-7557-4483-a771-2c79bdfa95c9
