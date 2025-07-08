@@ -1,0 +1,161 @@
+rbac.yaml
+----------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8s-error-agent
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-error-agent-role
+rules:
+  # Read permissions for monitoring and analysis
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events", "namespaces", "services"]
+    verbs: ["get", "list", "watch"]
+
+  # Write permissions for pod restart (delete pods)
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+
+  # ConfigMap permissions - FIXED: Added 'create' verb for revert functionality
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs:
+      ["get", "list", "watch", "create", "update", "patch", "replace", "delete"]
+
+  # Secret permissions - FIXED: Added 'create' verb for revert functionality
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs:
+      ["get", "list", "watch", "create", "update", "patch", "replace", "delete"]
+
+  # Permissions for deployment management (image revert and scaling)
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch", "patch", "update", "replace"]
+
+  # Permissions for scaling deployments
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "patch", "update"]
+
+  # Permissions to read deployment rollout history
+  - apiGroups: ["apps"]
+    resources: ["deployments/status"]
+    verbs: ["get"]
+
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+
+  # Permissions for networkpolicies (required for Helm rollback)
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-error-agent-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k8s-error-agent-role
+subjects:
+  - kind: ServiceAccount
+    name: k8s-error-agent
+    namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-error-agent-cluster-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: k8s-error-agent
+    namespace: default
+==========================================================================
+deployment.yaml
+-------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-error-agent-dev
+  namespace: default
+  labels:
+    app: k8s-error-agent-dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8s-error-agent-dev
+  template:
+    metadata:
+      labels:
+        app: k8s-error-agent-dev
+    spec:
+      serviceAccountName: k8s-error-agent
+      containers:
+        - name: error-agent
+          image: python:3.11-slim
+          imagePullPolicy: Always
+
+          # Just sleep so we can copy files and run manually
+          command: ["sleep"]
+          args: ["infinity"]
+
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: MISTRAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: mistral-api-secret
+                  key: api-key
+            - name: OUTPUT_DIR
+              value: "/app/output"
+            - name: CHECK_INTERVAL
+              value: "60"
+            - name: AUTO_REMEDIATION_ENABLED
+              value: "true"
+            - name: DRY_RUN_MODE
+              value: "false"
+            - name: SCALE_MAX_REPLICAS
+              value: "10"
+
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+
+          volumeMounts:
+            - name: output-volume
+              mountPath: /app/output
+
+      volumes:
+        - name: output-volume
+          emptyDir: {}
+
+      restartPolicy: Always
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mistral-api-secret
+  namespace: default
+type: Opaque
+stringData:
+  api-key: "Mdi0g0PXCIbLHxLZxmEDhON657hbyX7j"
