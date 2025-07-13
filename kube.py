@@ -1130,17 +1130,10 @@ class K8sErrorAnalysisAgent:
                 time.sleep(10)
 if __name__ == "__main__":
     try:
-        print("success-7")
+        print("success-14")
         agent = K8sErrorAnalysisAgent()
         agent.run()
     except Exception as e:
         logger.error(f"Fatal error starting agent: {e}")
         logger.error(traceback.format_exc())
         exit(1)
-
-
-
-
-
-
-
