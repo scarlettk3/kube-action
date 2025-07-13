@@ -54,6 +54,124 @@ def sanitize_text(text, max_length=2000):
         return str(text)[:max_length]
 
 class K8sErrorAnalysisAgent:
+    def get_all_helm_releases(self):
+        """Return a list of (namespace, release_name, revision) for all Helm releases in all namespaces."""
+        releases = []
+        try:
+            # Get all namespaces
+            namespaces = self.get_all_namespaces()
+            for ns in namespaces:
+                cmd = f"helm list -n {ns} --output json"
+                result = subprocess.run(cmd.split(), capture_output=True, text=True)
+                if result.returncode != 0:
+                    continue
+                for rel in json.loads(result.stdout):
+                    name = rel.get("name")
+                    revision = str(rel.get("revision"))
+                    if name and revision:
+                        releases.append((ns, name, revision))
+        except Exception as e:
+            logger.error(f"Error getting all Helm releases: {e}")
+        return releases
+
+    def get_pending_revision_from_configmap(self, namespace, release_name):
+        """Get the pending revision for a release from ConfigMap."""
+        configmap_name = "helm-pending-revisions"
+        key = f"{namespace}__{release_name}-pending-revision"
+        try:
+            cm = self.v1.read_namespaced_config_map(configmap_name, "default")
+            if cm.data and key in cm.data:
+                return cm.data[key]
+        except client.exceptions.ApiException as e:
+            if e.status == 404:
+                return None
+            logger.error(f"Error reading pending revision ConfigMap: {e}")
+        except Exception as e:
+            logger.error(f"Error reading pending revision ConfigMap: {e}")
+        return None
+
+    def set_pending_revision_in_configmap(self, namespace, release_name, revision):
+        """Set the pending revision for a release in the ConfigMap (overwrites any previous)."""
+        configmap_name = "helm-pending-revisions"
+        key = f"{namespace}__{release_name}-pending-revision"
+        try:
+            # Try to patch if exists, else create
+            try:
+                cm = self.v1.read_namespaced_config_map(configmap_name, "default")
+                data = cm.data or {}
+                data[key] = revision
+                body = {"data": data}
+                self.v1.patch_namespaced_config_map(configmap_name, "default", body)
+            except client.exceptions.ApiException as e:
+                if e.status == 404:
+                    # Create new ConfigMap
+                    data = {key: revision}
+                    cm = client.V1ConfigMap(metadata=client.V1ObjectMeta(name=configmap_name), data=data)
+                    self.v1.create_namespaced_config_map("default", cm)
+                else:
+                    raise
+        except Exception as e:
+            logger.error(f"Error setting pending revision in ConfigMap: {e}")
+
+    def clear_pending_revision_in_configmap(self, namespace, release_name):
+        """Set the pending revision for a release in the ConfigMap to empty string ("")."""
+        configmap_name = "helm-pending-revisions"
+        key = f"{namespace}__{release_name}-pending-revision"
+        try:
+            cm = self.v1.read_namespaced_config_map(configmap_name, "default")
+            data = cm.data or {}
+            data[key] = ""
+            body = {"data": data}
+            self.v1.patch_namespaced_config_map(configmap_name, "default", body)
+        except client.exceptions.ApiException as e:
+            if e.status != 404:
+                logger.error(f"Error clearing pending revision in ConfigMap: {e}")
+        except Exception as e:
+            logger.error(f"Error clearing pending revision in ConfigMap: {e}")
+
+    def process_pending_revisions_on_startup(self):
+        """On startup, check for any pending revisions in the ConfigMap and process them for 30s health check."""
+        logger.info("Checking for pending Helm revisions on startup...")
+        configmap_name = "helm-pending-revisions"
+        try:
+            cm = self.v1.read_namespaced_config_map(configmap_name, "default")
+            data = cm.data or {}
+            for key, revision in data.items():
+                if key.endswith("-pending-revision") and revision:
+                    try:
+                        ns, release = key[:-len("-pending-revision")].split("__", 1)
+                        logger.info(f"Startup: Found pending revision {revision} for {release} in {ns}, checking health for 30s...")
+                        threading.Thread(target=self.handle_helm_post_install_or_upgrade, args=(ns, release, 30), kwargs={"revision": revision}, daemon=True).start()
+                    except Exception as e:
+                        logger.error(f"Error processing pending revision {revision} for {key}: {e}")
+        except client.exceptions.ApiException as e:
+            if e.status != 404:
+                logger.error(f"Error reading pending revision ConfigMap: {e}")
+        except Exception as e:
+            logger.error(f"Error reading pending revision ConfigMap: {e}")
+
+    def reconcile_pending_configmap_with_helm(self):
+        """
+        On startup, ensure pending ConfigMap matches actual Helm state for all releases.
+        """
+        logger.info("Reconciling pending ConfigMap with actual Helm state...")
+        releases = self.get_all_helm_releases()
+        for ns, release_name, helm_revision in releases:
+            pending = self.get_pending_revision_from_configmap(ns, release_name)
+            if pending != helm_revision:
+                logger.info(f"Updating pending revision for {release_name} in {ns} to latest Helm revision {helm_revision}")
+                self.set_pending_revision_in_configmap(ns, release_name, helm_revision)
+
+    def _configmap_exists(self, name, namespace):
+        try:
+            self.v1.read_namespaced_config_map(name, namespace)
+            return True
+        except client.exceptions.ApiException as e:
+            if e.status == 404:
+                return False
+            raise
+        except Exception:
+            return False
     def __init__(self):
         try:
             config.load_incluster_config()
@@ -68,6 +186,7 @@ class K8sErrorAnalysisAgent:
         self.helm_releases = {}
         self.helm_rollback_attempts = {}
         self.failed_pod_queue = queue.Queue()
+        self.agent_active_event = threading.Event()  # To control agent active state
 
     def get_all_namespaces(self):
         """Get all namespaces in the cluster"""
@@ -579,7 +698,7 @@ class K8sErrorAnalysisAgent:
             logger.error(f"Unexpected error calling Mistral AI API: {e}")
             return {"success": False, "error": str(e)}
     def process_failed_pod_enhanced(self, pod, namespace):
-        """Enhanced pod analysis with comprehensive context gathering"""
+        """Enhanced pod analysis with comprehensive context gathering and improved chunked log readability"""
         try:
             pod_name = pod.metadata.name
             pod_uid = pod.metadata.uid
@@ -612,7 +731,7 @@ class K8sErrorAnalysisAgent:
                        for status in (pod.status.container_statuses or [])):
                     context["image_info"] = self.check_image_availability(container.image)
                     break
-                
+
             # Create enhanced prompt with all context
             prompt = self.create_ai_prompt(pod, namespace, context["logs"])
 
@@ -620,33 +739,37 @@ class K8sErrorAnalysisAgent:
             result = self.send_to_mistral(prompt)
 
             if not result.get("success", False):
-                logger.error(f"Failed to analyze pod {pod_name}: {result.get('error', 'Unknown error')}")
+                logger.error(f"\n❌❌❌\nFailed to analyze pod {pod_name}: {result.get('error', 'Unknown error')}\n❌❌❌\n")
                 return False
 
             # Parse the enhanced response
             analysis = self.parse_ai_response(result["analysis"])
 
-            # Log comprehensive analysis
-            logger.info("\n" + "="*100)
-            logger.info(f"ENHANCED ANALYSIS FOR POD: {pod_name} IN NAMESPACE: {namespace}")
-            logger.info("="*100)
+            # Abstracted chunked log for one failed pod (analysis + remediation)
+            logger.info("\n==================== FAILED POD CHUNK START ====================")
+            logger.info(f"FAILED POD: {pod_name} (uid={pod_uid}) in Namespace: {namespace}")
+            logger.info("***************************************************************")
+            logger.info("[ANALYSIS]")
             logger.info(f"ROOT CAUSE: {analysis.get('root_cause', 'Unknown')}")
             logger.info(f"RECOMMENDED ACTION: {analysis.get('action', 'None')}")
             logger.info(f"CONFIDENCE: {analysis.get('confidence', 'Unknown')}")
             logger.info(f"REASONING: {analysis.get('reasoning', 'No reasoning provided')}")
             if analysis.get('additional_checks'):
                 logger.info(f"ADDITIONAL CHECKS: {analysis.get('additional_checks')}")
-            logger.info("="*100)
-
+            logger.info("---------------------------------------------------------------")
+            logger.info("[REMEDIATION]")
             # Execute action based on confidence level
             if analysis.get('confidence') == 'HIGH' or analysis.get('confidence') == 'MEDIUM':
-                return self.execute_remediation_action(analysis, pod, namespace, context)
+                logger.info("Implementing remediation action for failed pod...")
+                remediation_result = self.execute_remediation_action(analysis, pod, namespace, context)
+                logger.info(f"Remediation result: {'SUCCESS' if remediation_result else 'NO ACTION/FAILED'}")
             else:
                 logger.warning(f"Low confidence in analysis for {pod_name}, skipping automatic remediation")
-                return False
+                logger.info("Remediation result: SKIPPED (Low confidence)")
+            logger.info("===================== FAILED POD CHUNK END =====================\n")
 
         except Exception as e:
-            logger.error(f"Error in enhanced pod analysis: {e}")
+            logger.error(f"\n❌ Error in enhanced pod analysis: {e}\n")
             return False
 
     def execute_remediation_action(self, analysis, pod, namespace, context):
@@ -841,63 +964,100 @@ class K8sErrorAnalysisAgent:
             logger.error(f"Error getting Helm release revision: {e}")
         return None
 
-    def handle_helm_post_install_or_upgrade(self, namespace: str, release_name: str, wait_seconds: int = 60, check_interval: int = 5):
+    # --- Per-release health check control ---
+    _health_check_locks = {}
+    _health_check_abort_flags = {}
+
+    def handle_helm_post_install_or_upgrade(self, namespace: str, release_name: str, wait_seconds: int = 30, check_interval: int = 5, revision: str = None):
         """
-        To be called after a Helm install/upgrade.
-        Waits up to wait_seconds for pods to become healthy.
-        Only marks the revision as stable if the revision hasn't changed during the check and pods are healthy.
-        Does NOT perform rollback or delete pods automatically.
+        Health check for new Helm revision: only update stable CM if healthy, clear pending if not. Never rollback or delete pods automatically.
         """
-        target_revision = self.get_helm_release_revision(namespace, release_name)
-        if not target_revision:
-            logger.error(f"Could not determine revision for release {release_name}")
-            return
-        waited = 0
-        while waited < wait_seconds:
-            current_revision = self.get_helm_release_revision(namespace, release_name)
-            if current_revision != target_revision:
-                logger.warning(f"Revision changed from {target_revision} to {current_revision} during health check. Aborting stable mark.")
+        key = f"{namespace}__{release_name}"
+        if key not in self._health_check_locks:
+            self._health_check_locks[key] = threading.Lock()
+        if key not in self._health_check_abort_flags:
+            self._health_check_abort_flags[key] = threading.Event()
+
+        with self._health_check_locks[key]:
+            while self.agent_active_event.is_set():
+                time.sleep(1)
+
+            self._health_check_abort_flags[key].set()
+            self._health_check_abort_flags[key] = threading.Event()
+            abort_flag = self._health_check_abort_flags[key]
+
+            target_revision = self.get_helm_release_revision(namespace, release_name)
+            if not target_revision:
+                logger.warning(f"No Helm revision found for release {release_name} in {namespace}, aborting health check.")
                 return
+
+            self.set_pending_revision_in_configmap(namespace, release_name, target_revision)
+            logger.info(f"Detected revision {target_revision} for release {release_name}, starting 30s health check.")
+            waited = 0
+            while waited < wait_seconds:
+                if abort_flag.is_set():
+                    logger.info(f"Health check for {release_name} in {namespace} aborted due to new revision.")
+                    return
+                current_revision = self.get_helm_release_revision(namespace, release_name)
+                if current_revision != target_revision:
+                    logger.info(f"Detected newer Helm revision {current_revision} for {release_name}, aborting and starting new check.")
+                    self.set_pending_revision_in_configmap(namespace, release_name, current_revision)
+                    threading.Thread(target=self.handle_helm_post_install_or_upgrade, args=(namespace, release_name, wait_seconds), kwargs={"revision": current_revision}, daemon=True).start()
+                    return
+                time.sleep(check_interval)
+                waited += check_interval
+
+            # After 30s, check pod health
             if self.is_release_pods_healthy(namespace, release_name):
-                # Double-check revision before marking as stable
-                final_revision = self.get_helm_release_revision(namespace, release_name)
-                if final_revision == target_revision:
-                    self.update_stable_revision_configmap(namespace, release_name, target_revision)
-                    logger.info(f"Release {release_name} revision {target_revision} marked as stable in ConfigMap.")
-                else:
-                    logger.warning(f"Revision changed to {final_revision} just before marking as stable. Aborting.")
-                return
-            time.sleep(check_interval)
-            waited += check_interval
-        logger.warning(f"Release {release_name} revision {target_revision} NOT marked as stable (pods not healthy after waiting {wait_seconds}s).")
+                self.update_stable_revision_configmap(namespace, release_name, target_revision)
+                logger.info(f"Revision {target_revision} for release {release_name} marked stable.")
+            else:
+                logger.info(f"Revision {target_revision} for release {release_name} not stable after 30s.")
+            self.clear_pending_revision_in_configmap(namespace, release_name)
 
     def watch_deployments_for_helm_events(self, namespace: str = None):
         """
-        Watch for Deployment events and only log stability after a full 30s health check. Update ConfigMap only if stable.
+        Watch for Deployment events and process Helm install/upgrade events.
+        Only log stability after health check, never rollback or delete pods automatically.
         """
         w = watch.Watch()
-        seen_revisions = {}  # { (namespace, release_name): last_revision }
         logger.info("Starting Deployment watch for Helm install/upgrade events...")
-        while True:
-            try:
-                stream = w.stream(self.apps_v1.list_deployment_for_all_namespaces if namespace is None else self.apps_v1.list_namespaced_deployment, namespace=namespace) if namespace else w.stream(self.apps_v1.list_deployment_for_all_namespaces)
-                for event in stream:
-                    dep = event['object']
-                    ns = dep.metadata.namespace
-                    labels = dep.metadata.labels or {}
-                    release_name = labels.get('helm.sh/release') or labels.get('release') or labels.get('app.kubernetes.io/instance')
-                    revision = dep.metadata.annotations.get('deployment.kubernetes.io/revision') if dep.metadata.annotations else None
-                    if release_name and revision:
-                        key = (ns, release_name)
-                        if seen_revisions.get(key) != revision:
-                            logger.info(f"Detected new revision {revision} for Helm release {release_name} in namespace {ns}. Waiting 30s for pod health check...")
-                            self.handle_helm_post_install_or_upgrade(ns, release_name, wait_seconds=30)
-                            seen_revisions[key] = revision
-            except Exception as e:
-                logger.error(f"Error in deployment watch: {e}")
-                
-                time.sleep(5)
 
+        self.reconcile_pending_configmap_with_helm()
+        self.process_pending_revisions_on_startup()
+
+        def event_handler():
+            while True:
+                while self.agent_active_event.is_set():
+                    time.sleep(1)
+                try:
+                    stream = w.stream(self.apps_v1.list_deployment_for_all_namespaces if namespace is None else self.apps_v1.list_namespaced_deployment, namespace=namespace) if namespace else w.stream(self.apps_v1.list_deployment_for_all_namespaces)
+                    for event in stream:
+                        dep = event['object']
+                        ns = dep.metadata.namespace
+                        labels = dep.metadata.labels or {}
+                        release_name = labels.get('helm.sh/release') or labels.get('release') or labels.get('app.kubernetes.io/instance')
+                        if not release_name:
+                            continue
+                        helm_revision = self.get_helm_release_revision(ns, release_name)
+                        if not helm_revision:
+                            continue
+                        prev_pending = self.get_pending_revision_from_configmap(ns, release_name)
+                        try:
+                            prev_pending_num = int(prev_pending) if prev_pending and prev_pending.isdigit() else -1
+                            helm_revision_num = int(helm_revision) if str(helm_revision).isdigit() else -1
+                        except Exception:
+                            prev_pending_num = -1
+                            helm_revision_num = -1
+                        if helm_revision_num <= prev_pending_num:
+                            continue
+                        threading.Thread(target=self.handle_helm_post_install_or_upgrade, args=(ns, release_name, 30), kwargs={"revision": helm_revision}, daemon=True).start()
+                except Exception as e:
+                    time.sleep(5)
+
+        threading.Thread(target=event_handler, daemon=True).start()
+        while True:
+            time.sleep(60)
     def restart_pod(self, namespace: str, pod_name: str):
         """Delete the pod to trigger a restart (if part of a ReplicaSet/Deployment)."""
         try:
@@ -936,7 +1096,7 @@ class K8sErrorAnalysisAgent:
 
     def run(self):
         """Main loop: watches Helm events in background, and processes failed pods one at a time using process_failed_pod_enhanced."""
-        logger.info("Starting Kubernetes Error Analysis Agent (with deployment watch and sequential failed pod analysis)")
+        logger.info("\n\nStarting Kubernetes Error Analysis Agent (with deployment watch and sequential failed pod analysis)\n\n")
 
         # Start the deployment watcher in a background thread
         watcher_thread = threading.Thread(target=self.watch_deployments_for_helm_events, kwargs={"namespace": None}, daemon=True)
@@ -945,35 +1105,42 @@ class K8sErrorAnalysisAgent:
         while True:
             try:
                 namespaces = self.get_all_namespaces()
-                logger.info(f"Found {len(namespaces)} namespaces")
+                logger.info(f"\nFound {len(namespaces)} namespaces in the cluster.\n")
 
                 for namespace in namespaces:
+                    logger.info(f"\nChecking for failed pods in namespace: {namespace} ...\n")
                     failed_pods = self.get_failed_pods(namespace)
-                    logger.info(f"Found {len(failed_pods)} failed pods in namespace {namespace}")
+                    logger.info(f"Found {len(failed_pods)} failed pods in namespace {namespace}\n")
 
                     for pod, pod_uid in failed_pods:
                         # Mark pod as analyzed to avoid duplicate processing
                         self.already_analyzed_pods.add(f"{namespace}/{pod_uid}")
 
                         # Process failed pod one at a time, sequentially
-                        logger.info(f"Analyzing failed pod {pod.metadata.name} (uid={pod_uid}) in namespace {namespace} using process_failed_pod_enhanced...")
+                        logger.info(f"Analyzing failed pod {pod.metadata.name} (uid={pod_uid}) in namespace {namespace} ...\n")
                         self.process_failed_pod_enhanced(pod, namespace)
                         time.sleep(REQUEST_DELAY)
 
-                logger.info(f"Sleeping for {CHECK_INTERVAL} seconds before next check")
+                logger.info(f"\nWaiting {CHECK_INTERVAL} seconds before next failed pod scan across all namespaces...\n{'='*80}\n")
                 time.sleep(CHECK_INTERVAL)
 
             except Exception as e:
-                logger.error(f"Error in main loop: {str(e)}")
+                logger.error(f"\nError in main loop: {str(e)}\n")
                 logger.error(traceback.format_exc())
                 time.sleep(10)
 if __name__ == "__main__":
     try:
-        print("success-3")
+        print("success-7")
         agent = K8sErrorAnalysisAgent()
         agent.run()
     except Exception as e:
         logger.error(f"Fatal error starting agent: {e}")
         logger.error(traceback.format_exc())
         exit(1)
-      
+
+
+
+
+
+
+
