@@ -150,6 +150,18 @@ class K8sErrorAnalysisAgent:
         except Exception as e:
             logger.error(f"Error reading pending revision ConfigMap: {e}")
 
+    def reconcile_pending_configmap_with_helm(self):
+        """
+        On startup, ensure pending ConfigMap matches actual Helm state for all releases.
+        """
+        logger.info("Reconciling pending ConfigMap with actual Helm state...")
+        releases = self.get_all_helm_releases()
+        for ns, release_name, helm_revision in releases:
+            pending = self.get_pending_revision_from_configmap(ns, release_name)
+            if pending != helm_revision:
+                logger.info(f"Updating pending revision for {release_name} in {ns} to latest Helm revision {helm_revision}")
+                self.set_pending_revision_in_configmap(ns, release_name, helm_revision)
+
     def _configmap_exists(self, name, namespace):
         try:
             self.v1.read_namespaced_config_map(name, namespace)
@@ -958,12 +970,7 @@ class K8sErrorAnalysisAgent:
     def handle_helm_post_install_or_upgrade(self, namespace: str, release_name: str, wait_seconds: int = 30, check_interval: int = 5, revision: str = None):
         """
         To be called after a Helm install/upgrade/rollback.
-        Only the latest revision is ever pending. If a new revision is set, abort any previous health check for this release.
-        After 30s, only mark as stable if pods are healthy; otherwise, clear pending (do not update stable).
-        Only log:
-        1. Detected new revision (install/upgrade/rollback)
-        2. Revision is stable and updated stable cm
-        3. Revision is NOT stable after 30s
+        Always use the latest Helm revision for pending/health check. Improved logging.
         """
         key = f"{namespace}__{release_name}"
         if key not in self._health_check_locks:
@@ -977,8 +984,10 @@ class K8sErrorAnalysisAgent:
             self._health_check_abort_flags[key] = threading.Event()
             abort_flag = self._health_check_abort_flags[key]
 
-            target_revision = revision or self.get_helm_release_revision(namespace, release_name)
+            # Always fetch the latest Helm revision
+            target_revision = self.get_helm_release_revision(namespace, release_name)
             if not target_revision:
+                logger.warning(f"No Helm revision found for release {release_name} in {namespace}, aborting health check.")
                 return
 
             # Only process if this revision is greater than the previous pending (if any)
@@ -989,24 +998,26 @@ class K8sErrorAnalysisAgent:
             except Exception:
                 prev_pending_num = -1
                 target_revision_num = -1
+            logger.info(f"Health check: release={release_name}, ns={namespace}, target Helm revision={target_revision}, previous pending={prev_pending}")
             if target_revision_num <= prev_pending_num:
+                logger.info(f"Target Helm revision {target_revision} for {release_name} in {namespace} is not newer than pending {prev_pending}, skipping health check.")
                 return
 
             # Set pending revision (overwrites any previous)
             self.set_pending_revision_in_configmap(namespace, release_name, target_revision)
-            logger.info(f"Detected new Helm revision {target_revision} for release {release_name}, keeping in pending cm, checking for 30s")
+            logger.info(f"Set pending revision {target_revision} for release {release_name} in {namespace}, starting health check for {wait_seconds}s.")
             waited = 0
             while waited < wait_seconds:
                 if abort_flag.is_set():
+                    logger.info(f"Health check for {release_name} in {namespace} aborted due to new revision.")
                     return
                 current_revision = self.get_helm_release_revision(namespace, release_name)
-                # If a new revision is detected, abort and update pending to the new revision
                 try:
                     current_revision_num = int(current_revision) if str(current_revision).isdigit() else -1
                 except Exception:
                     current_revision_num = -1
                 if current_revision_num > target_revision_num:
-                    # Set pending to the new revision and start a new health check thread for it
+                    logger.info(f"Detected newer Helm revision {current_revision} for {release_name} in {namespace} during health check, aborting and starting new check.")
                     self.set_pending_revision_in_configmap(namespace, release_name, current_revision)
                     threading.Thread(target=self.handle_helm_post_install_or_upgrade, args=(namespace, release_name, wait_seconds), kwargs={"revision": current_revision}, daemon=True).start()
                     return
@@ -1018,24 +1029,29 @@ class K8sErrorAnalysisAgent:
                         final_revision_num = -1
                     if final_revision_num == target_revision_num:
                         self.update_stable_revision_configmap(namespace, release_name, target_revision)
-                        logger.info(f"Revision {target_revision} for release {release_name} is stable. Updated helm-stable-revisions with {target_revision} for {release_name}")
+                        logger.info(f"Revision {target_revision} for release {release_name} in {namespace} is stable. Updated helm-stable-revisions.")
+                    else:
+                        logger.info(f"Revision {target_revision} for release {release_name} in {namespace} is stable, but final revision is {final_revision}.")
                     self.clear_pending_revision_in_configmap(namespace, release_name)
+                    logger.info(f"Cleared pending revision for {release_name} in {namespace} after successful health check.")
                     return
                 time.sleep(check_interval)
                 waited += check_interval
-            logger.info(f"Revision {target_revision} for release {release_name} is NOT stable after 30s.")
+            logger.info(f"Revision {target_revision} for release {release_name} in {namespace} is NOT stable after {wait_seconds}s.")
             self.clear_pending_revision_in_configmap(namespace, release_name)
+            logger.info(f"Cleared pending revision for {release_name} in {namespace} after failed health check.")
 
     def watch_deployments_for_helm_events(self, namespace: str = None):
         """
-        Watch for Deployment events and process Helm install/upgrade/rollback events:
-        Only log when a new revision is detected and processed.
+        Watch for Deployment events and process Helm install/upgrade/rollback events.
+        Always use the latest Helm revision for pending/health check. Improved logging.
         """
         import threading
         w = watch.Watch()
         logger.info("Starting Deployment watch for Helm install/upgrade/rollback events (strict pending logic)...")
 
-        # On startup, process any pending revisions in ConfigMap
+        # On startup, reconcile pending ConfigMap with Helm state
+        self.reconcile_pending_configmap_with_helm()
         self.process_pending_revisions_on_startup()
 
         def event_handler():
@@ -1047,21 +1063,28 @@ class K8sErrorAnalysisAgent:
                         ns = dep.metadata.namespace
                         labels = dep.metadata.labels or {}
                         release_name = labels.get('helm.sh/release') or labels.get('release') or labels.get('app.kubernetes.io/instance')
-                        revision = dep.metadata.annotations.get('deployment.kubernetes.io/revision') if dep.metadata.annotations else None
-                        if not (release_name and revision):
+                        if not release_name:
                             continue
-                        # Only process if this revision is greater than the previous pending
+                        # Always fetch the latest Helm revision for this release
+                        helm_revision = self.get_helm_release_revision(ns, release_name)
+                        if not helm_revision:
+                            logger.warning(f"Could not fetch Helm revision for release {release_name} in {ns}")
+                            continue
                         prev_pending = self.get_pending_revision_from_configmap(ns, release_name)
                         try:
                             prev_pending_num = int(prev_pending) if prev_pending and prev_pending.isdigit() else -1
-                            revision_num = int(revision) if str(revision).isdigit() else -1
+                            helm_revision_num = int(helm_revision) if str(helm_revision).isdigit() else -1
                         except Exception:
                             prev_pending_num = -1
-                            revision_num = -1
-                        if revision_num <= prev_pending_num:
+                            helm_revision_num = -1
+                        logger.info(f"Deployment event: release={release_name}, ns={ns}, detected Helm revision={helm_revision}, previous pending={prev_pending}")
+                        if helm_revision_num <= prev_pending_num:
+                            logger.info(f"Helm revision {helm_revision} for {release_name} in {ns} is not newer than pending {prev_pending}, skipping.")
                             continue
-                        threading.Thread(target=self.handle_helm_post_install_or_upgrade, args=(ns, release_name, 30), kwargs={"revision": revision}, daemon=True).start()
-                except Exception:
+                        logger.info(f"Starting health check for Helm revision {helm_revision} for release {release_name} in {ns}")
+                        threading.Thread(target=self.handle_helm_post_install_or_upgrade, args=(ns, release_name, 30), kwargs={"revision": helm_revision}, daemon=True).start()
+                except Exception as e:
+                    logger.error(f"Error in deployment event handler: {e}")
                     time.sleep(5)
 
         threading.Thread(target=event_handler, daemon=True).start()
@@ -1155,278 +1178,3 @@ if __name__ == "__main__":
 
 
 
-
-
-C:\Users\nkdua\Downloads\actionupdateVS>helm history nginx-1
-REVISION UPDATED STATUS CHART APP VERSION DESCRIPTION
-39 Sun Jul 13 07:17:08 2025 superseded nginx-21.0.1 1.29.0 Rollback to 35
-40 Sun Jul 13 12:48:11 2025 superseded nginx-13.2.24 1.23.3 Rollback to 37
-41 Sun Jul 13 12:55:58 2025 superseded nginx-21.0.1 1.29.0 Rollback to 31
-42 Sun Jul 13 07:26:24 2025 superseded nginx-13.2.24 1.23.3 Rollback to 40
-43 Sun Jul 13 13:52:43 2025 superseded nginx-21.0.1 1.29.0 Rollback to 35
-44 Sun Jul 13 08:24:20 2025 superseded nginx-13.2.24 1.23.3 Rollback to 40
-45 Sun Jul 13 16:30:25 2025 superseded nginx-21.0.1 1.29.0 Rollback to 36
-46 Sun Jul 13 11:01:07 2025 superseded nginx-13.2.24 1.23.3 Rollback to 44
-47 Sun Jul 13 16:54:33 2025 superseded nginx-21.0.1 1.29.0 Rollback to 43
-48 Sun Jul 13 11:25:38 2025 deployed nginx-13.2.24 1.23.3 Rollback to 46
-
-as you can see the latest rollback was actually 47 let me tell you why,
-because i rolled back to 43 which will give error, the ai agent detect it but didnt give any error anlysis, it performed rollback automatically which was why revsion no 48 cam which rolled nback to 46 which was succesful,
-
-the pending cm is a glitch, it is always taking previous revision no. and keeping it in cm, let me show you the logs so that you can understand.
-
-C:\Users\nkdua\Downloads\actionupdateVS>kubectl exec -it k8s-error-agent-dev-6579b68854-gcm9b -- /bin/bash
-root@k8s-error-agent-dev-6579b68854-gcm9b:/# cd /app
-root@k8s-error-agent-dev-6579b68854-gcm9b:/app# python kube-action.py
-success-7
-2025-07-13 11:21:43,942 - k8s-error-agent-dev - INFO - Loaded in-cluster Kubernetes configuration
-2025-07-13 11:21:43,945 - k8s-error-agent-dev - INFO -
-
-Starting Kubernetes Error Analysis Agent (with deployment watch and sequential failed pod analysis)
-
-2025-07-13 11:21:43,947 - k8s-error-agent-dev - INFO - Starting Deployment watch for Helm install/upgrade/rollback events (strict pending logic)...
-2025-07-13 11:21:43,948 - k8s-error-agent-dev - INFO - Checking for pending Helm revisions on startup...
-2025-07-13 11:21:44,045 - k8s-error-agent-dev - INFO - Startup: Found pending revision 46 for nginx-1 in default, checking health for 30s...
-2025-07-13 11:21:44,056 - k8s-error-agent-dev - INFO -
-Found 4 namespaces in the cluster.
-
-2025-07-13 11:21:44,057 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: default ...
-
-2025-07-13 11:21:44,440 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace default
-
-2025-07-13 11:21:44,448 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-node-lease ...
-
-2025-07-13 11:21:44,532 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-node-lease
-
-2025-07-13 11:21:44,533 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-public ...
-
-2025-07-13 11:21:44,555 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-public
-
-2025-07-13 11:21:44,555 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-system ...
-
-2025-07-13 11:21:44,919 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-system
-
-2025-07-13 11:21:44,920 - k8s-error-agent-dev - INFO -
-Waiting 60 seconds before next failed pod scan across all namespaces...
-2025-07-13 11:22:44,928 - k8s-error-agent-dev - INFO -
-Found 4 namespaces in the cluster.
-
-2025-07-13 11:22:44,928 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: default ...
-
-2025-07-13 11:22:45,044 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace default
-
-2025-07-13 11:22:45,045 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-node-lease ...
-
-2025-07-13 11:22:45,113 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-node-lease
-
-2025-07-13 11:22:45,117 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-public ...
-
-2025-07-13 11:22:45,131 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-public
-
-2025-07-13 11:22:45,132 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-system ...
-
-2025-07-13 11:22:45,234 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-system
-
-2025-07-13 11:22:45,234 - k8s-error-agent-dev - INFO -
-Waiting 60 seconds before next failed pod scan across all namespaces...
-2025-07-13 11:23:45,250 - k8s-error-agent-dev - INFO -
-Found 4 namespaces in the cluster.
-
-2025-07-13 11:23:45,250 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: default ...
-
-2025-07-13 11:23:45,398 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace default
-
-2025-07-13 11:23:45,398 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-node-lease ...
-
-2025-07-13 11:23:45,409 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-node-lease
-
-2025-07-13 11:23:45,409 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-public ...
-
-2025-07-13 11:23:45,429 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-public
-
-2025-07-13 11:23:45,429 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-system ...
-
-2025-07-13 11:23:45,790 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-system
-
-2025-07-13 11:23:45,791 - k8s-error-agent-dev - INFO -
-Waiting 60 seconds before next failed pod scan across all namespaces...
-2025-07-13 11:24:36,389 - k8s-error-agent-dev - INFO - Detected new Helm revision 41 for release nginx-1, keeping in pending cm, checking for 30s
-2025-07-13 11:24:45,818 - k8s-error-agent-dev - INFO -
-Found 4 namespaces in the cluster.
-
-2025-07-13 11:24:45,818 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: default ...
-
-2025-07-13 11:24:45,902 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace default
-
-2025-07-13 11:24:45,902 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-node-lease ...
-
-2025-07-13 11:24:45,907 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-node-lease
-
-2025-07-13 11:24:45,908 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-public ...
-
-2025-07-13 11:24:45,916 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-public
-
-2025-07-13 11:24:45,917 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-system ...
-
-2025-07-13 11:24:46,102 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-system
-
-2025-07-13 11:24:46,102 - k8s-error-agent-dev - INFO -
-Waiting 60 seconds before next failed pod scan across all namespaces...
-2025-07-13 11:25:40,775 - k8s-error-agent-dev - INFO - Detected new Helm revision 42 for release nginx-1, keeping in pending cm, checking for 30s
-2025-07-13 11:25:46,115 - k8s-error-agent-dev - INFO -
-Found 4 namespaces in the cluster.
-
-2025-07-13 11:25:46,116 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: default ...
-
-2025-07-13 11:25:46,176 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace default
-
-2025-07-13 11:25:46,176 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-node-lease ...
-
-2025-07-13 11:25:46,183 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-node-lease
-
-2025-07-13 11:25:46,183 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-public ...
-
-2025-07-13 11:25:46,191 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-public
-
-2025-07-13 11:25:46,192 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-system ...
-
-2025-07-13 11:25:46,376 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-system
-
-2025-07-13 11:25:46,377 - k8s-error-agent-dev - INFO -
-Waiting 60 seconds before next failed pod scan across all namespaces...
-2025-07-13 11:26:46,390 - k8s-error-agent-dev - INFO -
-Found 4 namespaces in the cluster.
-
-2025-07-13 11:26:46,390 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: default ...
-
-2025-07-13 11:26:46,492 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace default
-
-2025-07-13 11:26:46,493 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-node-lease ...
-
-2025-07-13 11:26:46,504 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-node-lease
-
-2025-07-13 11:26:46,505 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-public ...
-
-2025-07-13 11:26:46,567 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-public
-
-2025-07-13 11:26:46,569 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-system ...
-
-2025-07-13 11:26:46,885 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-system
-
-2025-07-13 11:26:46,885 - k8s-error-agent-dev - INFO -
-Waiting 60 seconds before next failed pod scan across all namespaces...
-2025-07-13 11:27:46,922 - k8s-error-agent-dev - INFO -
-Found 4 namespaces in the cluster.
-
-2025-07-13 11:27:46,923 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: default ...
-
-2025-07-13 11:27:47,049 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace default
-
-2025-07-13 11:27:47,049 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-node-lease ...
-
-2025-07-13 11:27:47,068 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-node-lease
-
-2025-07-13 11:27:47,070 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-public ...
-
-2025-07-13 11:27:47,093 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-public
-
-2025-07-13 11:27:47,094 - k8s-error-agent-dev - INFO -
-Checking for failed pods in namespace: kube-system ...
-
-2025-07-13 11:27:47,651 - k8s-error-agent-dev - INFO - Found 0 failed pods in namespace kube-system
-
-2025-07-13 11:27:47,652 - k8s-error-agent-dev - INFO -
-Waiting 60 seconds before next failed pod scan across all namespaces...
-first find out what is causing this, why is it not working properly? should i keep the code in another pod or what? first lets anlyse whre it is going wrong later we will write the code.
-
-                                                                                                                                 
-Based on your logs, Helm history, and the code, here’s a detailed analysis of what’s going wrong and why the agent is not behaving as expected:
-
-1. Problem Summary
-The agent is supposed to track Helm revisions, mark them as pending, health-check them, and then mark them as stable or clear pending.
-However, the "pending" ConfigMap is sometimes set to the previous revision, not the current one.
-The agent is not logging "Revision X is stable/NOT stable" after health checks.
-After a failed rollback, the agent seems to perform another rollback automatically, but there is no error analysis or log about the failed revision.
-2. Root Cause Analysis
-A. Pending Revision Logic
-The agent sets the pending revision in the ConfigMap when a new revision is detected in a deployment event.
-The health check thread is started for that revision.
-If a new revision is detected during the health check, the thread aborts and a new thread is started for the new revision.
-Issue:
-The code for setting the pending revision is based on the revision found in the deployment event, but the deployment event’s revision annotation (deployment.kubernetes.io/revision) does not always match the Helm revision (especially after rollbacks or failed upgrades).
-Helm’s revision is incremented on every operation, but the deployment’s annotation may lag or not update as expected, especially if the deployment fails to progress.
-
-Result:
-
-The agent may set the pending revision to an old revision (from the deployment event), not the actual latest Helm revision.
-This causes the ConfigMap to show the previous revision as pending, not the one that is actually being deployed.
-B. Health Check and Logging
-The health check thread only logs when a new revision is detected and when it finishes the 30s check.
-If the revision is not stable, it logs "Revision X is NOT stable after 30s."
-If the revision is stable, it logs "Revision X is stable. Updated helm-stable-revisions..."
-Issue:
-If the deployment event is for a failed revision (e.g., a rollback that fails), the agent may not see any pods for that revision, or the pods may not become healthy.
-If a new revision is deployed (e.g., another rollback), the previous health check thread aborts, and a new one starts.
-If the deployment event is missed (due to concurrency, thread timing, or event loss), the agent may not process the correct revision.
-
-Result:
-
-The agent may not log the stable/unstable message for the correct revision.
-The pending ConfigMap may be left with the wrong revision, or not cleared at all.
-C. Event Watching and Threading
-The agent watches deployment events and starts a new thread for each new revision.
-If multiple events come in quickly (e.g., multiple rollbacks), threads may overlap or abort each other.
-If the agent restarts, it processes all pending revisions in the ConfigMap, but if the ConfigMap is wrong, it processes the wrong revision.
-Result:
-
-The agent may miss or mishandle events, especially during rapid rollbacks or failed upgrades.
-The concurrency logic (abort flags, locks) is complex and may not always guarantee only the latest revision is processed.
-3. Should You Run the Agent in Another Pod?
-Running the agent in a different pod will not fix the core logic issues.
-The problem is not with the pod location, but with how the agent:
-
-Interprets deployment events and revision numbers.
-Synchronizes between Helm revision and deployment revision.
-Handles concurrency and event deduplication.
-4. Recommendations Before Code Changes
-The agent should always use the actual Helm revision (from helm list or helm history) when setting pending, not the deployment annotation.
-When a new revision is detected, fetch the latest Helm revision for the release and use that for pending/health check.
-Add more robust logging: always log which revision is being set as pending, which is being checked, and which is being marked as stable or not.
-Consider debouncing or batching deployment events to avoid race conditions.
-On startup, always reconcile the ConfigMap with the actual Helm state (e.g., if the pending revision is not the latest, update it).
-5. Next Steps
-Refactor the event handler to always fetch the latest Helm revision before setting pending.
-Improve logging to show every step: event received, revision detected, pending set, health check started, stable/unstable result, pending cleared.
-Optionally, add a periodic reconciliation loop to ensure the ConfigMap matches the actual Helm state.
-Summary:
-The root cause is a mismatch between deployment event revision and actual Helm revision, compounded by concurrency/threading issues. The agent should always use the Helm revision as the source of truth, and logging should be improved for every step. Running the agent in another pod will not solve this; the logic needs to be fixed.
-
-Would you like to proceed with a code fix for these issues?
-i want to proceed with the code fix.
