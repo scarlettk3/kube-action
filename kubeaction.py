@@ -873,6 +873,15 @@ class K8sErrorAnalysisAgent:
             if result.returncode == 0:
                 logger.info(f"Successfully rolled back {release_name} to revision {rollback_revision}")
                 self.helm_rollback_attempts[f"{namespace}/{release_name}"] = current_time
+                # After rollback, get the new revision and set it in pending ConfigMap
+                new_revision = self.get_helm_release_revision(namespace, release_name)
+                if new_revision:
+                    self.set_pending_revision_in_configmap(namespace, release_name, new_revision)
+                    logger.info(f"Set pending revision to {new_revision} for {release_name} after rollback")
+                    # Start health check for the new revision
+                    threading.Thread(target=self.handle_helm_post_install_or_upgrade, args=(namespace, release_name, 30), kwargs={"revision": new_revision}, daemon=True).start()
+                else:
+                    logger.warning(f"Could not determine new revision for {release_name} after rollback")
                 return True
             else:
                 logger.error(f"Error rolling back {release_name}: {result.stderr}")
@@ -991,6 +1000,13 @@ class K8sErrorAnalysisAgent:
                 logger.warning(f"No Helm revision found for release {release_name} in {namespace}, aborting health check.")
                 return
 
+            # Prevent repeated health checks for already stable revisions
+            stable_revision = self.get_stable_revision_from_configmap(namespace, release_name)
+            if stable_revision == target_revision:
+                logger.info(f"Revision {target_revision} for release {release_name} is already marked stable. Skipping health check.")
+                self.clear_pending_revision_in_configmap(namespace, release_name)
+                return
+
             self.set_pending_revision_in_configmap(namespace, release_name, target_revision)
             logger.info(f"Detected revision {target_revision} for release {release_name}, starting health check.")
             waited = 0
@@ -1026,57 +1042,60 @@ class K8sErrorAnalysisAgent:
         self.reconcile_pending_configmap_with_helm()
         self.process_pending_revisions_on_startup()
 
-        def event_handler():
-            while True:
-                while self.agent_active_event.is_set():
-                    time.sleep(1)
-                try:
-                    stream = w.stream(self.apps_v1.list_deployment_for_all_namespaces if namespace is None else self.apps_v1.list_namespaced_deployment, namespace=namespace) if namespace else w.stream(self.apps_v1.list_deployment_for_all_namespaces)
-                    for event in stream:
-                        dep = event['object']
-                        ns = dep.metadata.namespace
-                        labels = dep.metadata.labels or {}
-                        release_name = labels.get('helm.sh/release') or labels.get('release') or labels.get('app.kubernetes.io/instance')
-                        if not release_name:
-                            continue
-                        helm_revision = self.get_helm_release_revision(ns, release_name)
-                        if not helm_revision:
-                            continue
-                        prev_pending = self.get_pending_revision_from_configmap(ns, release_name)
-                        try:
-                            prev_pending_num = int(prev_pending) if prev_pending and prev_pending.isdigit() else -1
-                            helm_revision_num = int(helm_revision) if str(helm_revision).isdigit() else -1
-                        except Exception:
-                            prev_pending_num = -1
-                            helm_revision_num = -1
-                        if helm_revision_num <= prev_pending_num:
-                            continue
-                        threading.Thread(target=self.handle_helm_post_install_or_upgrade, args=(ns, release_name, 30), kwargs={"revision": helm_revision}, daemon=True).start()
-                except Exception as e:
-                    time.sleep(5)
-
-        threading.Thread(target=event_handler, daemon=True).start()
-        while True:
-            time.sleep(60)
-    def restart_pod(self, namespace: str, pod_name: str):
-        """Delete the pod to trigger a restart (if part of a ReplicaSet/Deployment)."""
         try:
-            self.v1.delete_namespaced_pod(pod_name, namespace)
-            logger.info(f"Restarted pod {namespace}/{pod_name} by deletion.")
-            return True
+            # Check if we've already attempted a rollback recently
+            current_time = time.time()
+            last_attempt = self.helm_rollback_attempts.get(f"{namespace}/{release_name}", 0)
+            if current_time - last_attempt < 300:  # 5 minutes cooldown
+                logger.info(f"Skipping rollback for {release_name} - too soon since last attempt")
+                return False
+
+            # Get last stable revision from ConfigMap
+            stable_revision = self.get_stable_revision_from_configmap(namespace, release_name)
+            if not stable_revision:
+                logger.warning(f"No stable revision found in ConfigMap for {release_name}, falling back to last deployed revision in Helm history.")
+                # Fallback: Use previous logic (last deployed revision)
+                cmd = f"helm history {release_name} -n {namespace} --max 10"
+                result = subprocess.run(cmd.split(), capture_output=True, text=True)
+                if result.returncode != 0:
+                    logger.error(f"Error getting Helm history: {result.stderr}")
+                    return False
+                lines = result.stdout.strip().split('\n')[1:]  # Skip header
+                last_success_revision = None
+                current_revision = None
+                for line in reversed(lines):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        revision, status = parts[0], parts[6]
+                        if current_revision is None:
+                            current_revision = revision
+                        if status.lower() == 'deployed':
+                            last_success_revision = revision
+                            break
+                if not last_success_revision or last_success_revision == current_revision:
+                    logger.info(f"No suitable revision found for rollback of {release_name}")
+                    return False
+                rollback_revision = last_success_revision
+            else:
+                rollback_revision = stable_revision
+
+            # Perform the rollback
+            cmd = f"helm rollback {release_name} {rollback_revision} -n {namespace}"
+            result = subprocess.run(cmd.split(), capture_output=True, text=True)
+            if result.returncode == 0:
+                logger.info(f"Successfully rolled back {release_name} to revision {rollback_revision}")
+                self.helm_rollback_attempts[f"{namespace}/{release_name}"] = current_time
+                # Immediately update both stable and pending ConfigMaps to prevent duplicate rollbacks and watcher triggers
+                self.update_stable_revision_configmap(namespace, release_name, rollback_revision)
+                self.clear_pending_revision_in_configmap(namespace, release_name)
+                return True
+            else:
+                logger.error(f"Error rolling back {release_name}: {result.stderr}")
+                return False
+
         except Exception as e:
-            logger.error(f"Error restarting pod {namespace}/{pod_name}: {e}")
+            logger.error(f"Error during Helm rollback for {release_name}: {str(e)}")
             return False
-
-
-    def get_failed_pods(self, namespace):
-        """Get all pods with non-successful status in a specific namespace, including failed init containers. Returns list of (pod, pod_uid) tuples."""
-        pods = self.v1.list_namespaced_pod(namespace=namespace)
-        failed_pods = []
-        for pod in pods.items:
-            pod_status = pod.status.phase
-            container_statuses = pod.status.container_statuses if pod.status.container_statuses else []
-            init_container_statuses = pod.status.init_container_statuses if hasattr(pod.status, 'init_container_statuses') and pod.status.init_container_statuses else []
             failed = False
             if pod_status in ["Failed", "Unknown"]:
                 failed = True
