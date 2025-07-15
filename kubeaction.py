@@ -1044,73 +1044,12 @@ class K8sErrorAnalysisAgent:
 
         try:
             # Check if we've already attempted a rollback recently
-            current_time = time.time()
-            last_attempt = self.helm_rollback_attempts.get(f"{namespace}/{release_name}", 0)
-            if current_time - last_attempt < 300:  # 5 minutes cooldown
-                logger.info(f"Skipping rollback for {release_name} - too soon since last attempt")
-                return False
+        w = watch.Watch()
+        logger.info("Starting Deployment watch for Helm install/upgrade events...")
 
-            # Get last stable revision from ConfigMap
-            stable_revision = self.get_stable_revision_from_configmap(namespace, release_name)
-            if not stable_revision:
-                logger.warning(f"No stable revision found in ConfigMap for {release_name}, falling back to last deployed revision in Helm history.")
-                # Fallback: Use previous logic (last deployed revision)
-                cmd = f"helm history {release_name} -n {namespace} --max 10"
-                result = subprocess.run(cmd.split(), capture_output=True, text=True)
-                if result.returncode != 0:
-                    logger.error(f"Error getting Helm history: {result.stderr}")
-                    return False
-                lines = result.stdout.strip().split('\n')[1:]  # Skip header
-                last_success_revision = None
-                current_revision = None
-                for line in reversed(lines):
-                    parts = line.split()
-                    if len(parts) >= 3:
-                        revision, status = parts[0], parts[6]
-                        if current_revision is None:
-                            current_revision = revision
-                        if status.lower() == 'deployed':
-                            last_success_revision = revision
-                            break
-                if not last_success_revision or last_success_revision == current_revision:
-                    logger.info(f"No suitable revision found for rollback of {release_name}")
-                    return False
-                rollback_revision = last_success_revision
-            else:
-                rollback_revision = stable_revision
-
-            # Perform the rollback
-            cmd = f"helm rollback {release_name} {rollback_revision} -n {namespace}"
-            result = subprocess.run(cmd.split(), capture_output=True, text=True)
-            if result.returncode == 0:
-                logger.info(f"Successfully rolled back {release_name} to revision {rollback_revision}")
-                self.helm_rollback_attempts[f"{namespace}/{release_name}"] = current_time
-                # Immediately update both stable and pending ConfigMaps to prevent duplicate rollbacks and watcher triggers
-                self.update_stable_revision_configmap(namespace, release_name, rollback_revision)
-                self.clear_pending_revision_in_configmap(namespace, release_name)
-                return True
-            else:
-                logger.error(f"Error rolling back {release_name}: {result.stderr}")
-                return False
-
-        except Exception as e:
-            logger.error(f"Error during Helm rollback for {release_name}: {str(e)}")
-            return False
-            failed = False
-            if pod_status in ["Failed", "Unknown"]:
-                failed = True
-            if any(cs.state.waiting and cs.state.waiting.reason in ["CrashLoopBackOff", "Error", "ErrImagePull", "ImagePullBackOff"] for cs in container_statuses):
-                failed = True
-            if any(cs.state.terminated and cs.state.terminated.exit_code != 0 for cs in container_statuses):
-                failed = True
-            if any(cs.state.waiting and cs.state.waiting.reason in ["CrashLoopBackOff", "Error", "ErrImagePull", "ImagePullBackOff"] for cs in init_container_statuses):
-                failed = True
-            if any(cs.state.terminated and cs.state.terminated.exit_code != 0 for cs in init_container_statuses):
-                failed = True
-            pod_uid = pod.metadata.uid
-            if failed and pod_uid not in self.already_analyzed_pods:
-                logger.info(f"Found failed pod: {namespace}/{pod.metadata.name} (uid={pod_uid})")
-                failed_pods.append((pod, pod_uid))
+        self.reconcile_pending_configmap_with_helm()
+        self.process_pending_revisions_on_startup()
+        # ...existing code...
         return failed_pods
 
     def run(self):
