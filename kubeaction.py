@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import time
+from alive_progress import alive_bar
 import json
 import logging
 import datetime
@@ -782,7 +783,12 @@ class K8sErrorAnalysisAgent:
         elif action == "ROLLBACK":
             helm_release = context.get('helm_release')
             if helm_release:
-                logger.info(f"Executing ROLLBACK action for Helm release {helm_release}")
+                logger.info(f"LLM recommended ROLLBACK for Helm release {helm_release}. Will perform rollback after 30 seconds.")
+                with alive_bar(30, title=f"Rollback timer for {helm_release}", bar='smooth', force_tty=True) as bar:
+                    for _ in range(30):
+                        time.sleep(1)
+                        bar()
+                logger.info(f"Performing ROLLBACK for Helm release {helm_release} after 30 seconds delay.")
                 return self.perform_helm_rollback(namespace, helm_release)
             else:
                 logger.warning(f"Cannot perform rollback for {pod_name} - no Helm release detected")
@@ -834,7 +840,7 @@ class K8sErrorAnalysisAgent:
             # Check if we've already attempted a rollback recently
             current_time = time.time()
             last_attempt = self.helm_rollback_attempts.get(f"{namespace}/{release_name}", 0)
-            if current_time - last_attempt < 60:  # 5 minutes cooldown
+            if current_time - last_attempt < 60:  # 60 sec cooldown
                 logger.info(f"Skipping rollback for {release_name} - too soon since last attempt")
                 return False
 
@@ -1122,7 +1128,10 @@ class K8sErrorAnalysisAgent:
                         time.sleep(REQUEST_DELAY)
 
                 logger.info(f"\nWaiting {CHECK_INTERVAL} seconds before next failed pod scan across all namespaces...\n{'='*80}\n")
-                time.sleep(CHECK_INTERVAL)
+                with alive_bar(CHECK_INTERVAL, title="Agent sleep timer", bar='smooth', force_tty=True) as bar:
+                    for _ in range(CHECK_INTERVAL):
+                        time.sleep(1)
+                        bar()
 
             except Exception as e:
                 logger.error(f"\nError in main loop: {str(e)}\n")
