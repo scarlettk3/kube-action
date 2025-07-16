@@ -747,7 +747,7 @@ class K8sErrorAnalysisAgent:
             analysis = self.parse_ai_response(result["analysis"])
 
             # Abstracted chunked log for one failed pod (analysis + remediation)
-            logger.info("\n==================== FAILED POD CHUNK START ====================")
+            logger.info("\n==================== 🔴FAILED POD CHUNK START ====================")
             logger.info(f"FAILED POD: {pod_name} (uid={pod_uid}) in Namespace: {namespace}")
             logger.info("***************************************************************")
             logger.info("[ANALYSIS]")
@@ -998,7 +998,7 @@ class K8sErrorAnalysisAgent:
                 return
 
             self.set_pending_revision_in_configmap(namespace, release_name, target_revision)
-            # logger.info(f"Detected revision {target_revision} for release {release_name}, starting health check.")
+            logger.info(f"Detected revision {target_revision} for release {release_name}, starting health check.")
             waited = 0
             while waited < wait_seconds:
                 if abort_flag.is_set():
@@ -1016,7 +1016,7 @@ class K8sErrorAnalysisAgent:
             # After 30s, check pod health
             if self.is_release_pods_healthy(namespace, release_name):
                 self.update_stable_revision_configmap(namespace, release_name, target_revision)
-                # logger.info(f"Revision {target_revision} for release {release_name} marked stable.")
+                logger.info(f"Revision {target_revision} for release {release_name} marked stable.")
             else:
                 logger.info(f"Revision {target_revision} for release {release_name} not stable")
             self.clear_pending_revision_in_configmap(namespace, release_name)
